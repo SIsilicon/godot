@@ -34,7 +34,6 @@
 #include "scene/gui/container.h"
 #include "scene/gui/popup.h"
 class TabContainer : public Container {
-
 	GDCLASS(TabContainer, Container);
 
 public:
@@ -66,6 +65,7 @@ private:
 	Vector<Control *> _get_tabs() const;
 	int _get_tab_width(int p_index) const;
 	void _on_theme_changed();
+	void _repaint();
 	void _on_mouse_exited();
 	void _update_current_tab();
 

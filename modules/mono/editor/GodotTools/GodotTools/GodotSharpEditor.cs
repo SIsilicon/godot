@@ -6,6 +6,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
+using System.Linq;
 using GodotTools.Ides;
 using GodotTools.Ides.Rider;
 using GodotTools.Internals;
@@ -36,6 +37,8 @@ namespace GodotTools
         private WeakRef exportPluginWeak; // TODO Use WeakReference once we have proper serialization
 
         public BottomPanel BottomPanel { get; private set; }
+
+        public PlaySettings? CurrentPlaySettings { get; set; }
 
         public static string ProjectAssemblyName
         {
@@ -228,15 +231,39 @@ namespace GodotTools
         [UsedImplicitly]
         public Error OpenInExternalEditor(Script script, int line, int col)
         {
-            var editor = (ExternalEditorId)editorSettings.GetSetting("mono/editor/external_editor");
+            var editorId = (ExternalEditorId)editorSettings.GetSetting("mono/editor/external_editor");
 
-            switch (editor)
+            switch (editorId)
             {
                 case ExternalEditorId.None:
-                    // Tells the caller to fallback to the global external editor settings or the built-in editor
+                    // Not an error. Tells the caller to fallback to the global external editor settings or the built-in editor.
                     return Error.Unavailable;
                 case ExternalEditorId.VisualStudio:
-                    throw new NotSupportedException();
+                {
+                    string scriptPath = ProjectSettings.GlobalizePath(script.ResourcePath);
+
+                    var args = new List<string>
+                    {
+                        GodotSharpDirs.ProjectSlnPath,
+                        line >= 0 ? $"{scriptPath};{line + 1};{col + 1}" : scriptPath
+                    };
+
+                    string command = Path.Combine(GodotSharpDirs.DataEditorToolsDir, "GodotTools.OpenVisualStudio.exe");
+
+                    try
+                    {
+                        if (Godot.OS.IsStdoutVerbose())
+                            Console.WriteLine($"Running: \"{command}\" {string.Join(" ", args.Select(a => $"\"{a}\""))}");
+
+                        OS.RunProcess(command, args);
+                    }
+                    catch (Exception e)
+                    {
+                        GD.PushError($"Error when trying to run code editor: VisualStudio. Exception message: '{e.Message}'");
+                    }
+
+                    break;
+                }
                 case ExternalEditorId.VisualStudioForMac:
                     goto case ExternalEditorId.MonoDevelop;
                 case ExternalEditorId.Rider:
@@ -249,17 +276,20 @@ namespace GodotTools
                 {
                     string scriptPath = ProjectSettings.GlobalizePath(script.ResourcePath);
 
-                    if (line >= 0)
-                        GodotIdeManager.SendOpenFile(scriptPath, line + 1, col);
-                    else
-                        GodotIdeManager.SendOpenFile(scriptPath);
+                    GodotIdeManager.LaunchIdeAsync().ContinueWith(launchTask =>
+                    {
+                        var editorPick = launchTask.Result;
+                        if (line >= 0)
+                            editorPick?.SendOpenFile(scriptPath, line + 1, col);
+                        else
+                            editorPick?.SendOpenFile(scriptPath);
+                    });
 
                     break;
                 }
-
                 case ExternalEditorId.VsCode:
                 {
-                    if (_vsCodePath.Empty() || !File.Exists(_vsCodePath))
+                    if (string.IsNullOrEmpty(_vsCodePath) || !File.Exists(_vsCodePath))
                     {
                         // Try to search it again if it wasn't found last time or if it was removed from its location
                         _vsCodePath = VsCodeNames.SelectFirstNotNull(OS.PathWhich, orElse: string.Empty);
@@ -300,7 +330,7 @@ namespace GodotTools
                     if (line >= 0)
                     {
                         args.Add("-g");
-                        args.Add($"{scriptPath}:{line + 1}:{col}");
+                        args.Add($"{scriptPath}:{line}:{col}");
                     }
                     else
                     {
@@ -311,7 +341,7 @@ namespace GodotTools
 
                     if (OS.IsOSX)
                     {
-                        if (!osxAppBundleInstalled && _vsCodePath.Empty())
+                        if (!osxAppBundleInstalled && string.IsNullOrEmpty(_vsCodePath))
                         {
                             GD.PushError("Cannot find code editor: VSCode");
                             return Error.FileNotFound;
@@ -321,7 +351,7 @@ namespace GodotTools
                     }
                     else
                     {
-                        if (_vsCodePath.Empty())
+                        if (string.IsNullOrEmpty(_vsCodePath))
                         {
                             GD.PushError("Cannot find code editor: VSCode");
                             return Error.FileNotFound;
@@ -341,7 +371,6 @@ namespace GodotTools
 
                     break;
                 }
-
                 default:
                     throw new ArgumentOutOfRangeException();
             }
@@ -417,7 +446,7 @@ namespace GodotTools
                 aboutLabel.Text =
                     "C# support in Godot Engine is in late alpha stage and, while already usable, " +
                     "it is not meant for use in production.\n\n" +
-                    "Projects can be exported to Linux, macOS, Windows and Android, but not yet to iOS, HTML5 or UWP. " +
+                    "Projects can be exported to Linux, macOS, Windows, Android, iOS and HTML5, but not yet to UWP. " +
                     "Bugs and usability issues will be addressed gradually over future releases, " +
                     "potentially including compatibility breaking changes as new features are implemented for a better overall C# experience.\n\n" +
                     "If you experience issues with this Mono build, please report them on Godot's issue tracker with details about your system, MSBuild version, IDE, etc.:\n\n" +
@@ -454,8 +483,14 @@ namespace GodotTools
 
                     // Apply the other fixes only after configurations have been migrated
 
+                    // Make sure the existing project has the ProjectTypeGuids property (for VisualStudio)
+                    ProjectUtils.EnsureHasProjectTypeGuids(msbuildProject);
+
                     // Make sure the existing project has Api assembly references configured correctly
                     ProjectUtils.FixApiHintPath(msbuildProject);
+
+                    // Make sure the existing project references the Microsoft.NETFramework.ReferenceAssemblies nuget package
+                    ProjectUtils.EnsureHasNugetNetFrameworkRefAssemblies(msbuildProject);
 
                     if (msbuildProject.HasUnsavedChanges)
                     {
@@ -494,7 +529,8 @@ namespace GodotTools
 
             if (OS.IsWindows)
             {
-                settingsHintStr += $",MonoDevelop:{(int)ExternalEditorId.MonoDevelop}" +
+                settingsHintStr += $",Visual Studio:{(int)ExternalEditorId.VisualStudio}" +
+                                   $",MonoDevelop:{(int)ExternalEditorId.MonoDevelop}" +
                                    $",Visual Studio Code:{(int)ExternalEditorId.VsCode}" +
                                    $",JetBrains Rider:{(int)ExternalEditorId.Rider}";
             }
@@ -505,7 +541,7 @@ namespace GodotTools
                                    $",Visual Studio Code:{(int)ExternalEditorId.VsCode}" +
                                    $",JetBrains Rider:{(int)ExternalEditorId.Rider}";
             }
-            else if (OS.IsUnixLike())
+            else if (OS.IsUnixLike)
             {
                 settingsHintStr += $",MonoDevelop:{(int)ExternalEditorId.MonoDevelop}" +
                                    $",Visual Studio Code:{(int)ExternalEditorId.VsCode}" +
